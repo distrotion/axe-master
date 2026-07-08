@@ -1,0 +1,820 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Axe Master</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100%;
+    background: #1c140e;
+    overflow: hidden;
+    touch-action: manipulation;
+    -webkit-user-select: none;
+    user-select: none;
+    font-family: 'Tahoma', sans-serif;
+  }
+  #wrap {
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  canvas {
+    display: block;
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+    cursor: pointer;
+  }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game"></canvas></div>
+<script>
+'use strict';
+
+// ============================================================
+//  AXE MASTER — knife-hit style, Norse theme (Viking series #2)
+//  แตะเพื่อปาขวานใส่โล่หมุน อย่าให้โดนขวานที่ปักอยู่!
+// ============================================================
+
+const W = 360, H = 640;
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+canvas.width = W;
+canvas.height = H;
+ctx.imageSmoothingEnabled = false;
+
+function fitCanvas() {
+  const s = Math.min(window.innerWidth / W, window.innerHeight / H);
+  if (!(s > 0)) return; // hidden tab / zero viewport — keep last size
+  canvas.style.width  = Math.floor(W * s) + 'px';
+  canvas.style.height = Math.floor(H * s) + 'px';
+}
+window.addEventListener('resize', fitCanvas);
+fitCanvas();
+
+// ============================================================
+//  SPRITES
+// ============================================================
+const SPRITES = [
+  'axe', 'axe_counter', 'shield_wood', 'shield_dark', 'shield_boss',
+  'apple_gold', 'apple_split', 'torch', 'hit_spark', 'wood_chips'
+];
+const img = {};
+let loaded = 0;
+for (const name of SPRITES) {
+  const im = new Image();
+  im.src = 'assets/' + name + '.png';
+  im.onload = () => loaded++;
+  im.onerror = () => loaded++;
+  img[name] = im;
+}
+
+// ============================================================
+//  AUDIO (WebAudio chiptune, no files)
+// ============================================================
+let audioCtx = null;
+function ensureAudio() {
+  if (!audioCtx) {
+    try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); }
+    catch (e) { audioCtx = null; }
+  }
+  if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+}
+function beep(freq, dur, type, vol, slideTo, delay) {
+  if (!audioCtx) return;
+  const t0 = audioCtx.currentTime + (delay || 0);
+  const osc = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+  osc.type = type || 'square';
+  osc.frequency.setValueAtTime(freq, t0);
+  if (slideTo) osc.frequency.exponentialRampToValueAtTime(slideTo, t0 + dur);
+  g.gain.setValueAtTime(vol || 0.15, t0);
+  g.gain.exponentialRampToValueAtTime(0.001, t0 + dur);
+  osc.connect(g).connect(audioCtx.destination);
+  osc.start(t0);
+  osc.stop(t0 + dur);
+}
+function sfxThrow() { beep(280, 0.09, 'triangle', 0.16, 950); }
+function sfxStick() { beep(140, 0.09, 'square', 0.28, 85); beep(60, 0.07, 'sine', 0.25); }
+function sfxClang() { beep(620, 0.28, 'square', 0.18, 210); beep(935, 0.22, 'sawtooth', 0.12, 300); }
+function sfxApple() { beep(900, 0.06, 'square', 0.12, 1400); beep(1568, 0.10, 'square', 0.10, 0, 0.06); }
+function sfxClear() { beep(660, 0.09, 'square', 0.12); beep(880, 0.09, 'square', 0.12, 0, 0.09); beep(1320, 0.16, 'square', 0.12, 0, 0.18); }
+function sfxHorn()  {
+  if (!audioCtx) return;
+  const t0 = audioCtx.currentTime;
+  [110, 165, 220].forEach((f, i) => {
+    const osc = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    osc.type = 'sawtooth';
+    osc.frequency.value = f;
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(0.07, t0 + 0.15);
+    g.gain.exponentialRampToValueAtTime(0.001, t0 + 0.9 + i * 0.05);
+    osc.connect(g).connect(audioCtx.destination);
+    osc.start(t0);
+    osc.stop(t0 + 1.1);
+  });
+}
+
+// ============================================================
+//  MUSIC — เพลงไวกิ้งแต่งเองในโค้ด (ชุดเดียวกับ Viking Flappy)
+// ============================================================
+let musicGain = null, noiseBuf = null;
+const music = {
+  on: localStorage.getItem('axe-master-music') !== '0',
+  started: false,
+  step: 0,
+  nextT: 0
+};
+const STEP_DUR = 60 / 96 / 4;
+const A4 = 440, B4 = 493.88, C5 = 523.25, D5 = 587.33, E5 = 659.25,
+      G4 = 392, E4 = 329.63;
+const MELODY = [
+  A4,0,C5,0,B4,A4,G4,0,   E4,0,G4,0,A4,0,0,0,
+  A4,0,C5,0,D5,0,E5,0,    D5,C5,B4,0,A4,0,0,0,
+  E5,0,D5,0,C5,0,B4,0,    C5,0,B4,0,A4,0,0,0,
+  G4,0,A4,0,B4,0,C5,B4,   A4,0,0,0,A4,0,0,0
+];
+const MELODY_STEPS = MELODY.length * 2;
+
+function initMusicNodes() {
+  musicGain = audioCtx.createGain();
+  musicGain.gain.value = music.on ? 1 : 0;
+  musicGain.connect(audioCtx.destination);
+  noiseBuf = audioCtx.createBuffer(1, Math.floor(audioCtx.sampleRate * 0.3), audioCtx.sampleRate);
+  const d = noiseBuf.getChannelData(0);
+  for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  const lp = audioCtx.createBiquadFilter();
+  lp.type = 'lowpass';
+  lp.frequency.value = 320;
+  const dg = audioCtx.createGain();
+  dg.gain.value = 0.04;
+  [110, 110.6, 220.4].forEach(f => {
+    const o = audioCtx.createOscillator();
+    o.type = 'sawtooth';
+    o.frequency.value = f;
+    o.connect(lp);
+    o.start();
+  });
+  lp.connect(dg).connect(musicGain);
+}
+function drum(t, freq, dur, vol) {
+  const o = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+  o.type = 'sine';
+  o.frequency.setValueAtTime(freq, t);
+  o.frequency.exponentialRampToValueAtTime(Math.max(30, freq * 0.35), t + dur);
+  g.gain.setValueAtTime(vol, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  o.connect(g).connect(musicGain);
+  o.start(t);
+  o.stop(t + dur);
+  const n = audioCtx.createBufferSource();
+  n.buffer = noiseBuf;
+  const hp = audioCtx.createBiquadFilter();
+  hp.type = 'highpass';
+  hp.frequency.value = 900;
+  const ng = audioCtx.createGain();
+  ng.gain.setValueAtTime(vol * 0.3, t);
+  ng.gain.exponentialRampToValueAtTime(0.001, t + 0.06);
+  n.connect(hp).connect(ng).connect(musicGain);
+  n.start(t);
+  n.stop(t + 0.08);
+}
+function melodyNote(t, freq, dur, vol) {
+  const o = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+  o.type = 'triangle';
+  o.frequency.value = freq;
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(vol, t + 0.02);
+  g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  o.connect(g).connect(musicGain);
+  o.start(t);
+  o.stop(t + dur + 0.05);
+  const o2 = audioCtx.createOscillator();
+  const g2 = audioCtx.createGain();
+  o2.type = 'square';
+  o2.frequency.value = freq / 2;
+  g2.gain.setValueAtTime(0.0001, t);
+  g2.gain.exponentialRampToValueAtTime(vol * 0.22, t + 0.02);
+  g2.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  o2.connect(g2).connect(musicGain);
+  o2.start(t);
+  o2.stop(t + dur + 0.05);
+}
+function startMusic() {
+  if (music.started || !audioCtx) return;
+  music.started = true;
+  initMusicNodes();
+  music.nextT = audioCtx.currentTime + 0.1;
+  setInterval(scheduleMusic, 90);
+}
+function scheduleMusic() {
+  if (!audioCtx) return;
+  while (music.nextT < audioCtx.currentTime + 0.25) {
+    const s = music.step % MELODY_STEPS;
+    if (s % 4 === 0) drum(music.nextT, 130, 0.22, s % 16 === 0 ? 0.28 : 0.16);
+    if (s % 16 === 14) drum(music.nextT, 180, 0.10, 0.10);
+    if (s % 2 === 0) {
+      const f = MELODY[s / 2];
+      if (f) melodyNote(music.nextT, f, STEP_DUR * 2.4, 0.08);
+    }
+    music.step++;
+    music.nextT += STEP_DUR;
+  }
+}
+function toggleMusic() {
+  music.on = !music.on;
+  localStorage.setItem('axe-master-music', music.on ? '1' : '0');
+  ensureAudio();
+  if (music.on && !music.started) startMusic();
+  if (musicGain && audioCtx) musicGain.gain.setTargetAtTime(music.on ? 1 : 0, audioCtx.currentTime, 0.05);
+}
+
+// ============================================================
+//  GAME STATE
+// ============================================================
+const ST_READY = 0, ST_PLAY = 1, ST_CLEAR = 2, ST_DEAD = 3;
+let state = ST_READY;
+
+const CX = 180, CY = 225, R = 140;      // shield center / radius (sprite native 280)
+const AXE_W = 32, AXE_H = 72;
+const AXE_READY_Y = 545;                 // center of the waiting axe
+const THROW_SPEED = 1500;                // px/s
+const FAIL_ARC  = 0.20;                  // rad — hit another axe
+const APPLE_ARC = 0.17;                  // rad — hit an apple
+
+const TAU = Math.PI * 2, HALF_PI = Math.PI / 2;
+function normAng(a) { a %= TAU; return a < 0 ? a + TAU : a; }
+function angDiff(a, b) {
+  let d = Math.abs(normAng(a) - normAng(b));
+  return Math.min(d, TAU - d);
+}
+
+let stage, score, best, apples, stuck, axesLeft, shieldRot, angVel, patTimer;
+let flying, readyDelay, clearT, deathTimer, deadAxe, shake, newBest;
+best = +(localStorage.getItem('axe-master-best') || 0);
+
+function shieldSkin() {
+  if (stage % 4 === 0) return 'shield_boss';
+  return stage % 2 === 1 ? 'shield_wood' : 'shield_dark';
+}
+
+function startStage(n) {
+  stage = n;
+  stuck = [];
+  apples = [];
+  flying = null;
+  readyDelay = 0;
+  clearT = 0;
+  shieldRot = 0;
+  angVel = (1.2 + n * 0.13) * (Math.random() < 0.5 ? 1 : -1);
+  patTimer = 1 + Math.random();
+  axesLeft = 5 + Math.min(4, Math.floor(n * 0.7));
+  // pre-stuck axes (harder on later stages)
+  const pre = Math.min(3, Math.floor((n - 1) / 2));
+  for (let i = 0; i < pre; i++) {
+    stuck.push({ a: normAng(Math.PI + (i - (pre - 1) / 2) * 0.9 + (Math.random() - 0.5) * 0.3) });
+  }
+  // apples (none on boss stages)
+  if (stage % 4 !== 0) {
+    const nApples = 1 + (n % 3 === 0 ? 1 : 0);
+    for (let i = 0; i < nApples; i++) {
+      let a, tries = 0;
+      do {
+        a = Math.random() * TAU;
+        tries++;
+      } while (tries < 20 && (stuck.some(s => angDiff(a, s.a) < 0.5) || apples.some(ap => angDiff(a, ap.a) < 0.6)));
+      apples.push({ a, split: false });
+    }
+  }
+}
+
+function reset() {
+  score = 0;
+  newBest = false;
+  shake = 0;
+  deathTimer = 0;
+  deadAxe = null;
+  particles.length = 0;
+  fx.length = 0;
+  startStage(1);
+}
+
+// ============================================================
+//  PARTICLES & FLYING PIECES
+// ============================================================
+const particles = [];
+const fx = []; // {sprite, x, y, vx, vy, rot, vr, t, life}
+function burst(x, y, color, n, spd) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * TAU;
+    const sp = (spd || 120) * (0.4 + Math.random());
+    particles.push({
+      x, y,
+      vx: Math.cos(a) * sp,
+      vy: Math.sin(a) * sp - 60,
+      life: 0.35 + Math.random() * 0.45,
+      t: 0, color,
+      size: Math.random() < 0.5 ? 2 : 3
+    });
+  }
+}
+function addFx(sprite, x, y, vx, vy, vr) {
+  fx.push({ sprite, x, y, vx, vy, rot: 0, vr, t: 0, life: 1.4 });
+}
+
+reset();
+state = ST_READY;
+
+// ============================================================
+//  INPUT
+// ============================================================
+function tap() {
+  ensureAudio();
+  if (music.on) startMusic();
+  if (state === ST_READY) {
+    state = ST_PLAY;
+    sfxHorn();
+    return;
+  }
+  if (state === ST_PLAY) {
+    throwAxe();
+  } else if (state === ST_DEAD && deathTimer > 0.7) {
+    reset();
+    state = ST_READY;
+  }
+}
+function throwAxe() {
+  if (flying || readyDelay > 0 || axesLeft <= 0) return;
+  flying = { y: AXE_READY_Y };
+  sfxThrow();
+}
+
+const MUTE_BTN = { x: W - 30, y: 8, w: 22, h: 22 };
+function pointerDown(clientX, clientY) {
+  const r = canvas.getBoundingClientRect();
+  const px = (clientX - r.left) * (W / r.width);
+  const py = (clientY - r.top) * (H / r.height);
+  if (px >= MUTE_BTN.x - 5 && px <= MUTE_BTN.x + MUTE_BTN.w + 5 &&
+      py >= MUTE_BTN.y - 5 && py <= MUTE_BTN.y + MUTE_BTN.h + 5) {
+    ensureAudio();
+    toggleMusic();
+    return;
+  }
+  tap();
+}
+canvas.addEventListener('mousedown', (e) => pointerDown(e.clientX, e.clientY));
+canvas.addEventListener('touchstart', (e) => {
+  e.preventDefault();
+  const t = e.touches[0];
+  if (t) pointerDown(t.clientX, t.clientY);
+}, { passive: false });
+window.addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.code === 'ArrowUp') { e.preventDefault(); tap(); }
+  if (e.code === 'KeyM') toggleMusic();
+});
+
+// ============================================================
+//  UPDATE
+// ============================================================
+function update(dt) {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.t += dt;
+    if (p.t >= p.life) { particles.splice(i, 1); continue; }
+    p.vy += 750 * dt;
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+  }
+  for (let i = fx.length - 1; i >= 0; i--) {
+    const f = fx[i];
+    f.t += dt;
+    if (f.t >= f.life) { fx.splice(i, 1); continue; }
+    f.vy += 850 * dt;
+    f.x += f.vx * dt;
+    f.y += f.vy * dt;
+    f.rot += f.vr * dt;
+  }
+  if (shake > 0) shake = Math.max(0, shake - dt * 30);
+
+  if (state === ST_READY) {
+    shieldRot += 0.6 * dt;
+    return;
+  }
+
+  if (state === ST_PLAY) {
+    // rotation pattern: change speed/direction periodically
+    patTimer -= dt;
+    if (patTimer <= 0) {
+      const spd = 1.2 + stage * 0.13;
+      const roll = Math.random();
+      if (roll < 0.15 && stage > 2) angVel = 0;                        // brief pause
+      else if (roll < 0.55) angVel = spd * (Math.random() < 0.5 ? 1 : -1);
+      else angVel = (spd + 0.8 + Math.random() * 0.6) * (angVel >= 0 ? -1 : 1);
+      patTimer = (angVel === 0 ? 0.35 : 0.7 + Math.random() * 0.9);
+    }
+    shieldRot = normAng(shieldRot + angVel * dt);
+    if (readyDelay > 0) readyDelay -= dt;
+
+    if (flying) {
+      flying.y -= THROW_SPEED * dt;
+      const tipY = flying.y - AXE_H / 2;          // axe head tip
+      if (tipY <= CY + R - 14) resolveHit();
+    }
+  }
+
+  if (state === ST_CLEAR) {
+    shieldRot += angVel * 0.3 * dt;
+    clearT += dt;
+    if (clearT > 0.9) {
+      startStage(stage + 1);
+      state = ST_PLAY;
+    }
+  }
+
+  if (state === ST_DEAD) {
+    deathTimer += dt;
+    shieldRot += angVel * 0.25 * dt;
+    if (deadAxe) {
+      deadAxe.vy += 1400 * dt;
+      deadAxe.x += deadAxe.vx * dt;
+      deadAxe.y += deadAxe.vy * dt;
+      deadAxe.rot += deadAxe.vr * dt;
+      if (deadAxe.y > H + 80) deadAxe = null;
+    }
+  }
+}
+
+function resolveHit() {
+  flying = null;
+  const localA = normAng(-shieldRot); // impact angle in shield space
+  // hit an existing axe? → fail
+  for (const sa of stuck) {
+    if (angDiff(localA, sa.a) < FAIL_ARC) {
+      fail();
+      return;
+    }
+  }
+  // hit an apple? → bonus (axe still sticks)
+  for (const ap of apples) {
+    if (!ap.split && angDiff(localA, ap.a) < APPLE_ARC) {
+      ap.split = true;
+      score += 2;
+      sfxApple();
+      burst(CX, CY + R - 6, '#f0c53f', 12, 160);
+      addFx('apple_split', CX - 20, CY + R - 10, -90, -180, -7);
+      addFx('apple_split', CX + 20 - 34, CY + R - 10, 90, -220, 7);
+      checkBest();
+    }
+  }
+  // stick!
+  stuck.push({ a: localA });
+  score++;
+  axesLeft--;
+  sfxStick();
+  shake = 5;
+  burst(CX, CY + R + 4, '#8a6a42', 8, 100);
+  checkBest();
+  if (axesLeft <= 0) {
+    stageClear();
+  } else {
+    readyDelay = 0.13;
+  }
+}
+
+function stageClear() {
+  state = ST_CLEAR;
+  clearT = 0;
+  const bonus = stage % 4 === 0 ? 5 : 2;
+  score += bonus;
+  checkBest();
+  sfxClear();
+  // axes fly off the shield
+  for (const sa of stuck) {
+    const w = shieldRot + sa.a + HALF_PI;
+    const ox = Math.cos(w), oy = Math.sin(w);
+    addFx('axe', CX + ox * (R + 22) - 16, CY + oy * (R + 22) - 36,
+          ox * 260 + (Math.random() - 0.5) * 80, oy * 260 - 140, (Math.random() - 0.5) * 16);
+  }
+  stuck = [];
+  burst(CX, CY, '#c9a86a', 26, 240);
+  burst(CX, CY, '#8a6a42', 18, 180);
+  shake = 8;
+}
+
+function fail() {
+  state = ST_DEAD;
+  deathTimer = 0;
+  shake = 9;
+  sfxClang();
+  deadAxe = { x: CX, y: CY + R + 30, vx: (Math.random() - 0.5) * 260, vy: 280, rot: 0, vr: 13 };
+  burst(CX, CY + R - 6, '#e8e4da', 10, 200);
+  burst(CX, CY + R - 6, '#f0c53f', 6, 160);
+}
+
+function checkBest() {
+  if (score > best) {
+    best = score;
+    newBest = true;
+    localStorage.setItem('axe-master-best', best);
+  }
+}
+
+// ============================================================
+//  DRAW — background (wooden hall + torches)
+// ============================================================
+function drawBackground(t) {
+  ctx.fillStyle = '#2b211a';
+  ctx.fillRect(0, 0, W, H);
+  // plank grid
+  ctx.fillStyle = '#241b14';
+  for (let x = 40; x < W; x += 40) ctx.fillRect(x, 0, 2, H);
+  for (let y = 64; y < H; y += 64) ctx.fillRect(0, y, W, 2);
+  // torch warm glow (flicker)
+  for (const tx of [46, W - 46]) {
+    const fl = 0.10 + 0.04 * Math.sin(t / 90 + tx);
+    const g = ctx.createRadialGradient(tx, 120, 8, tx, 120, 95);
+    g.addColorStop(0, 'rgba(240,180,60,' + fl.toFixed(3) + ')');
+    g.addColorStop(1, 'rgba(240,180,60,0)');
+    ctx.fillStyle = g;
+    ctx.fillRect(tx - 95, 25, 190, 190);
+    ctx.drawImage(img['torch'], tx - 13, 95);
+  }
+  // vignette
+  const v = ctx.createRadialGradient(CX, H / 2, 150, CX, H / 2, 420);
+  v.addColorStop(0, 'rgba(0,0,0,0)');
+  v.addColorStop(1, 'rgba(0,0,0,0.42)');
+  ctx.fillStyle = v;
+  ctx.fillRect(0, 0, W, H);
+}
+
+// ============================================================
+//  DRAW — shield + stuck axes + apples
+// ============================================================
+function drawShield() {
+  ctx.save();
+  ctx.translate(CX, CY);
+  if (state === ST_CLEAR) {
+    const k = 1 + Math.sin(Math.min(1, clearT / 0.25) * Math.PI) * 0.12;
+    ctx.scale(k, k);
+  }
+  ctx.rotate(shieldRot);
+  ctx.drawImage(img[shieldSkin()], -R, -R);
+  for (const ap of apples) {
+    if (ap.split) continue;
+    ctx.save();
+    ctx.rotate(ap.a);
+    ctx.translate(0, R - 12);
+    ctx.drawImage(img['apple_gold'], -17, -17);
+    ctx.restore();
+  }
+  for (const sa of stuck) {
+    ctx.save();
+    ctx.rotate(sa.a);
+    ctx.drawImage(img['axe'], -AXE_W / 2, R - 14);
+    ctx.restore();
+  }
+  ctx.restore();
+}
+
+// ============================================================
+//  DRAW — axes & aim line
+// ============================================================
+function drawReadyAxe(t) {
+  if (state !== ST_PLAY) return;
+  if (!flying && readyDelay <= 0 && axesLeft > 0) {
+    // dotted aim line
+    ctx.fillStyle = 'rgba(240,230,200,' + (0.35 + 0.2 * Math.sin(t / 200)).toFixed(2) + ')';
+    for (let y = CY + R + 40; y < AXE_READY_Y - 60; y += 22) {
+      ctx.beginPath();
+      ctx.arc(CX, y, 3, 0, TAU);
+      ctx.fill();
+    }
+    ctx.drawImage(img['axe'], CX - AXE_W / 2, AXE_READY_Y - AXE_H / 2);
+  }
+  if (flying) {
+    ctx.drawImage(img['axe'], CX - AXE_W / 2, Math.round(flying.y) - AXE_H / 2);
+  }
+}
+
+// ============================================================
+//  PIXEL DIGIT FONT (3x5)
+// ============================================================
+const DIGITS = {
+  '0': ['111','101','101','101','111'],
+  '1': ['010','110','010','010','111'],
+  '2': ['111','001','111','100','111'],
+  '3': ['111','001','111','001','111'],
+  '4': ['101','101','111','001','001'],
+  '5': ['111','100','111','001','111'],
+  '6': ['111','100','111','101','111'],
+  '7': ['111','001','010','010','010'],
+  '8': ['111','101','111','101','111'],
+  '9': ['111','101','111','001','111']
+};
+function drawPixelNumber(num, cx, y, sc) {
+  const str = String(num);
+  const dw = 3 * sc, gap = sc;
+  const total = str.length * dw + (str.length - 1) * gap;
+  let x0 = Math.round(cx - total / 2);
+  for (const pass of [1, 0]) {
+    let x = x0;
+    for (const ch of str) {
+      const rows = DIGITS[ch];
+      if (!rows) { x += dw + gap; continue; }
+      for (let r = 0; r < 5; r++) {
+        for (let c = 0; c < 3; c++) {
+          if (rows[r][c] === '1') {
+            if (pass) {
+              ctx.fillStyle = '#241a10';
+              ctx.fillRect(x + c * sc - 1, y + r * sc - 1, sc + 2, sc + 3);
+            } else {
+              ctx.fillStyle = '#e8d5a0';
+              ctx.fillRect(x + c * sc, y + r * sc, sc, sc);
+            }
+          }
+        }
+      }
+      x += dw + gap;
+    }
+  }
+}
+
+// ============================================================
+//  UI
+// ============================================================
+function drawTextStroked(text, x, y, size, fill, align) {
+  ctx.font = 'bold ' + size + 'px Tahoma, sans-serif';
+  ctx.textAlign = align || 'center';
+  ctx.textBaseline = 'middle';
+  ctx.lineWidth = Math.max(3, size / 7);
+  ctx.strokeStyle = 'rgba(24,17,10,0.9)';
+  ctx.strokeText(text, x, y);
+  ctx.fillStyle = fill;
+  ctx.fillText(text, x, y);
+}
+
+function drawMuteBtn() {
+  const b = MUTE_BTN;
+  ctx.fillStyle = 'rgba(24,17,10,0.55)';
+  ctx.fillRect(b.x, b.y, b.w, b.h);
+  ctx.fillStyle = '#e8d5a0';
+  ctx.fillRect(b.x + 3, b.y + 8, 3, 6);
+  ctx.beginPath();
+  ctx.moveTo(b.x + 6, b.y + 11);
+  ctx.lineTo(b.x + 11, b.y + 5);
+  ctx.lineTo(b.x + 11, b.y + 17);
+  ctx.closePath();
+  ctx.fill();
+  if (music.on) {
+    ctx.strokeStyle = '#e8d5a0';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(b.x + 11, b.y + 11, 4.5, -0.8, 0.8);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(b.x + 11, b.y + 11, 8, -0.7, 0.7);
+    ctx.stroke();
+  } else {
+    ctx.strokeStyle = '#c25050';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(b.x + 13, b.y + 7);
+    ctx.lineTo(b.x + 19, b.y + 15);
+    ctx.moveTo(b.x + 19, b.y + 7);
+    ctx.lineTo(b.x + 13, b.y + 15);
+    ctx.stroke();
+  }
+}
+
+function drawBanner(text, cy) {
+  const pw = 250, ph = 56;
+  const px = (W - pw) / 2;
+  ctx.fillStyle = '#4a3018';
+  ctx.fillRect(px - 4, cy - 4, pw + 8, ph + 8);
+  ctx.fillStyle = '#6b4426';
+  ctx.fillRect(px, cy, pw, ph);
+  ctx.fillStyle = '#33220f';
+  [[6, 6], [pw - 10, 6], [6, ph - 10], [pw - 10, ph - 10]].forEach(([nx, ny]) => {
+    ctx.fillRect(px + nx, cy + ny, 4, 4);
+  });
+  drawTextStroked(text, W / 2, cy + ph / 2, 24, '#e8d5a0');
+}
+
+function drawUI(t) {
+  drawMuteBtn();
+
+  if (state === ST_PLAY || state === ST_CLEAR || state === ST_DEAD) {
+    drawPixelNumber(score, W / 2, 22, 7);
+    drawTextStroked('STAGE ' + stage + (stage % 4 === 0 ? ' ⚔ BOSS' : ''), W / 2, 74, 13, stage % 4 === 0 ? '#e8b34b' : '#cbb98e');
+    // remaining axes (bottom-left row)
+    for (let i = 0; i < axesLeft; i++) {
+      ctx.drawImage(img['axe_counter'], 12 + i * 20, H - 34);
+    }
+  }
+
+  if (state === ST_READY) {
+    drawTextStroked('AXE MASTER', W / 2, 120, 34, '#e8d5a0');
+    drawTextStroked('ปาขวานพิชิตโล่ไวกิ้ง', W / 2, 154, 16, '#cbb98e');
+    if (Math.sin(t / 300) > -0.3) {
+      drawTextStroked('แตะเพื่อปาขวาน', W / 2, 480, 18, '#ffffff');
+    }
+    drawTextStroked('ระวังขวานที่ปักอยู่ · เก็บแอปเปิ้ลทอง +2', W / 2, 512, 12, '#cbb98e');
+    drawTextStroked('สถิติสูงสุด: ' + best, W / 2, 540, 13, '#e8d5a0');
+  }
+
+  if (state === ST_CLEAR && clearT > 0.1) {
+    drawBanner('STAGE CLEAR!', 280);
+  }
+
+  if (state === ST_DEAD && deathTimer > 0.4) {
+    const pw = 250, ph = 150;
+    const px = (W - pw) / 2, py = 270;
+    ctx.fillStyle = '#4a3018';
+    ctx.fillRect(px - 4, py - 4, pw + 8, ph + 8);
+    ctx.fillStyle = '#6b4426';
+    ctx.fillRect(px, py, pw, ph);
+    ctx.fillStyle = '#33220f';
+    [[6, 6], [pw - 10, 6], [6, ph - 10], [pw - 10, ph - 10]].forEach(([nx, ny]) => {
+      ctx.fillRect(px + nx, py + ny, 4, 4);
+    });
+    drawTextStroked('GAME OVER', W / 2, py + 28, 24, '#e8d5a0');
+    drawTextStroked('คะแนน', px + 70, py + 62, 12, '#cbb98e');
+    drawPixelNumber(score, px + 70, py + 74, 5);
+    drawTextStroked('สูงสุด', px + pw - 70, py + 62, 12, '#cbb98e');
+    drawPixelNumber(best, px + pw - 70, py + 74, 5);
+    drawTextStroked('ถึงด่าน ' + stage, W / 2, py + 122, 14, '#e8d5a0');
+    if (newBest) drawTextStroked('★ สถิติใหม่! ★', W / 2, py + ph + 24, 15, '#7ee8a8');
+    if (deathTimer > 0.7 && Math.sin(t / 300) > -0.3) {
+      drawTextStroked('แตะเพื่อเล่นอีกครั้ง', W / 2, py + ph + (newBest ? 48 : 28), 15, '#ffffff');
+    }
+  }
+}
+
+// ============================================================
+//  MAIN LOOP
+// ============================================================
+let lastT = performance.now();
+function frame(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+
+  if (loaded < SPRITES.length) {
+    ctx.fillStyle = '#2b211a';
+    ctx.fillRect(0, 0, W, H);
+    drawTextStroked('LOADING...', W / 2, H / 2, 18, '#e8d5a0');
+    requestAnimationFrame(frame);
+    return;
+  }
+
+  update(dt);
+
+  ctx.save();
+  if (shake > 0) {
+    ctx.translate(Math.round((Math.random() - 0.5) * shake), Math.round((Math.random() - 0.5) * shake));
+  }
+
+  drawBackground(now);
+  drawShield();
+  drawReadyAxe(now);
+
+  if (deadAxe) {
+    ctx.save();
+    ctx.translate(deadAxe.x, deadAxe.y);
+    ctx.rotate(deadAxe.rot);
+    ctx.drawImage(img['axe'], -AXE_W / 2, -AXE_H / 2);
+    ctx.restore();
+  }
+
+  for (const f of fx) {
+    ctx.save();
+    ctx.globalAlpha = Math.max(0, 1 - f.t / f.life);
+    ctx.translate(f.x + 17, f.y + 17);
+    ctx.rotate(f.rot);
+    ctx.drawImage(img[f.sprite], -17, -17);
+    ctx.restore();
+  }
+  ctx.globalAlpha = 1;
+
+  for (const p of particles) {
+    ctx.globalAlpha = 1 - p.t / p.life;
+    ctx.fillStyle = p.color;
+    ctx.fillRect(Math.round(p.x), Math.round(p.y), p.size, p.size);
+  }
+  ctx.globalAlpha = 1;
+
+  ctx.restore();
+
+  drawUI(now);
+
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
